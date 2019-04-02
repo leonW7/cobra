@@ -27,7 +27,7 @@ import json
 import pipes
 
 from .log import logger
-from .config import Config, issue_history_path
+from .config import Config, issue_history_path, core_path
 from .__version__ import __version__, __python_version__, __platform__, __url__
 from .exceptions import PickupException, NotExistException, AuthFailedException
 from .pickup import Git, NotExistError, AuthError, Decompress
@@ -128,14 +128,23 @@ class ParseArgs(object):
         return output_mode
 
     def target_directory(self, target_mode):
-        reg = '^((ht|f)tps?):\/\/[\w\-]+(\.[\w\-]+)+([\w\-\.,@?^=%&:\/~\+#]*[\w\-\@?^=%&\/~\+#])?$'
+        reg = '^(https?):\/\/[\w\-]+(\.[\w\-:]+)+([\w\-\.?\/]+)?$'
         target_directory = None
         if target_mode == TARGET_MODE_GIT:
             logger.debug('GIT Project')
             # branch or tag
             split_target = self.target.split(':')
+            if len(split_target) == 4:
+                target, branch = '{p}:{u}:{f}'.format(p=split_target[0], u=split_target[1], f=split_target[2]), \
+                                 split_target[-1]
+                if re.match(reg, target) is None:
+                    logger.critical('Please enter a valid URL')
+                    exit()
+                branch = pipes.quote(branch)
             if len(split_target) == 3:
                 target, branch = '{p}:{u}'.format(p=split_target[0], u=split_target[1]), split_target[-1]
+                if '/' in branch:
+                    target, branch = '{t}:{b}'.format(t=target, b=branch), 'master'
                 if re.match(reg, target) is None:
                     logger.critical('Please enter a valid URL')
                     exit()
@@ -407,6 +416,37 @@ def get_safe_ex_string(ex, encoding=None):
     return get_unicode(ret or "", encoding=encoding).strip()
 
 
+def class_to_path(target_projects, class_name):
+    """
+    转换Java class名为绝对路径，用于跨文件的检测
+    :param target_projects: 项目根目录
+    :param class_name: import类名
+    :return:
+    """
+    class_path = ''
+
+    if class_name and '.' in class_name:
+        class_rpath = class_name.replace('.', '/') + '.java'  # 转换类名为相对路径
+    else:
+        class_rpath = ''
+        logger.warning("[UNTIL] Class_name can't None, False or empty !")
+
+    if target_projects:
+        for root, dirs, files in os.walk(target_projects):
+            for f in files:
+                if f.endswith('.java'):
+                    class_new_path = os.path.join(root, f)
+                    if class_rpath in class_new_path:
+                        class_path = class_new_path
+
+        if class_path != '':
+            logger.debug("[UNTIL] The class {c} path {p}".format(c=class_name, p=class_path))
+    else:
+        logger.warning("[UNTIL] Target_projects can't None, False or empty !")
+
+    return class_path
+
+
 class Tool:
     def __init__(self):
 
@@ -442,7 +482,7 @@ class Tool:
                     if 'gfind' == filename:
                         gfind = os.path.join(root, filename)
             if ggrep == '':
-                logger.critical("brew install ggrep pleases!")
+                logger.critical("brew install grep pleases!")
                 sys.exit(0)
             else:
                 self.grep = ggrep
@@ -467,9 +507,10 @@ def secure_filename(filename):
         filename = normalize('NFKD', filename).encode('utf-8', 'ignore')
         if not PY2:
             filename = filename.decode('utf-8')
-    for sep in os.path.sep, os.path.altsep:
-        if sep:
-            filename = filename.replace(sep, ' ')
+
+    if filename in (os.path.sep, os.path.altsep, os.path.pardir):
+        return ""
+
     if PY2:
         filename = filename.decode('utf-8')
     filename = _filename_utf8_strip_re.sub('', '_'.join(filename.split()))
@@ -515,7 +556,7 @@ def unhandled_exception_message():
         cv=__version__,
         pv=__python_version__,
         os=__platform__,
-        cl=re.sub(r".+?\bcobra.py\b", "cobra.py", " ".join(sys.argv).encode('utf-8'))
+        cl=re.sub(r".+?\bcobra.py\b", "cobra.py", " ".join(sys.argv))
     )
     return err_msg
 
@@ -538,6 +579,7 @@ def create_github_issue(err_msg, exc_msg):
     _ = re.sub(r"\s+line \d+", "", _)
     _ = re.sub(r'File ".+?/(\w+\.py)', "\g<1>", _)
     _ = re.sub(r".+\Z", "", _)
+    _ = _.encode('utf-8')
     key = hashlib.md5(_).hexdigest()[:8]
 
     if key in issues:
@@ -547,7 +589,10 @@ def create_github_issue(err_msg, exc_msg):
     ex = None
 
     try:
-        url = "https://api.github.com/search/issues?q={q}".format(q=urllib.quote("repo:WhaleShark-Team/cobra [AUTO] Unhandled exception (#{k})".format(k=key)))
+        if PY2:  # python2用urllib.quote, python3用urllib.parse.quote
+            url = "https://api.github.com/search/issues?q={q}".format(q=urllib.quote("repo:WhaleShark-Team/cobra [AUTO] Unhandled exception (#{k})".format(k=key)))
+        else:
+            url = "https://api.github.com/search/issues?q={q}".format(q=urllib.parse.quote("repo:WhaleShark-Team/cobra [AUTO] Unhandled exception (#{k})".format(k=key)))
         logger.debug(url)
         resp = requests.get(url=url)
         content = resp.json()
@@ -570,7 +615,7 @@ def create_github_issue(err_msg, exc_msg):
             "title": "[AUTO] Unhandled exception (#{k})".format(k=key),
             "body": "## Environment\n```\n{err}\n```\n## Traceback\n```\n{exc}\n```\n".format(err=err_msg, exc=exc_msg)
         }
-        headers = {"Authorization": "token {t}".format(t=base64.b64decode(access_token))}
+        headers = {"Authorization": "token {t}".format(t=base64.b64decode(access_token).decode('utf-8'))}
         resp = requests.post(url=url, data=json.dumps(data), headers=headers)
         content = resp.text
     except Exception as ex:
@@ -605,3 +650,50 @@ def clean_dir(filepath):
         elif os.path.isdir(filepath):
             shutil.rmtree(filepath, True)
     return True
+
+
+def create_projects_hash():
+    """
+    用于获取Cobra主要文件的md5值
+    :return:
+    """
+    hash_list = []
+    for fi in os.listdir(core_path):  # 遍历所有文件，并记录md5到列表中
+        if os.path.splitext(fi)[1] == '.py':
+            file_path = os.path.join(core_path, fi)
+            with open(file_path, 'r') as file_handler:
+                data = file_handler.read()
+                md5_data = md5(data)
+                hash_list.append(md5_data)
+
+    project_hash = md5(''.join(hash_list))
+    return project_hash
+
+
+def set_config_hash():
+    """
+    保存项目md5到config文件中
+    :return:
+    """
+    project_hash = create_projects_hash()
+    result = Config('hash', 'modified').set(project_hash)  # 修改config文件的MD5，用于本地代码校验
+
+    if result is True:
+        logger.info('[HASH] Projects hash save success')
+        return True
+    return False
+
+
+def get_config_hash():
+    """
+    读取项目md5并生成新md5进行比较，相同则项目未改变；否则，项目已被修改
+    :return: Bool，True，项目未修改；False，项目已被修改
+    """
+    new_md5 = create_projects_hash()
+    old_md5 = Config('hash', 'modified').value
+    if new_md5 == old_md5:
+        logger.info('[HASH] Projects is\'t modified')
+        return True
+    else:
+        logger.info('[HASH] Projects is modified')
+        return False
